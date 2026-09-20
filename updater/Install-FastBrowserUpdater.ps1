@@ -1,20 +1,26 @@
 param(
-    [string]$BaselineVersion = '1.2.0',
     [string]$CosignSource = ''
 )
 
 $ErrorActionPreference = 'Stop'
+Set-StrictMode -Version 2.0
+
+Import-Module ScheduledTasks -ErrorAction Stop
+
+$ReleaseRepo = 'mustad450-pixel/fast-browser-releases'
+$ManifestUrl = "https://raw.githubusercontent.com/$ReleaseRepo/main/update.json"
+$UpdaterUrl = "https://raw.githubusercontent.com/$ReleaseRepo/main/updater/FastBrowserUpdater.ps1"
+$CosignUrl = 'https://github.com/sigstore/cosign/releases/download/v3.1.3/cosign-windows-amd64.exe'
+$ExpectedCosignSha256 = '9fe59be0eca1271873ce019061335eb1ac419b7059202e797828467ddabe33be'
 $UpdaterDir = Join-Path $env:LOCALAPPDATA 'Fast Sector\Fast Browser\Updater'
 $UpdaterPath = Join-Path $UpdaterDir 'FastBrowserUpdater.ps1'
 $CosignPath = Join-Path $UpdaterDir 'cosign.exe'
 $StatePath = Join-Path $UpdaterDir 'state.json'
-$ExpectedCosignSha256 = '9fe59be0eca1271873ce019061335eb1ac419b7059202e797828467ddabe33be'
-$UpdaterUrl = 'https://raw.githubusercontent.com/mustad450-pixel/fast-browser-releases/main/updater/FastBrowserUpdater.ps1'
-$CosignUrl = 'https://github.com/sigstore/cosign/releases/download/v3.1.3/cosign-windows-amd64.exe'
+$ChromePath = Join-Path $env:LOCALAPPDATA 'Fast Sector\Fast Browser\Application\chrome.exe'
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 New-Item -ItemType Directory -Path $UpdaterDir -Force | Out-Null
-Invoke-WebRequest -Uri $UpdaterUrl -OutFile $UpdaterPath -UseBasicParsing -TimeoutSec 120
+Invoke-WebRequest -Uri ($UpdaterUrl + '?ts=' + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) -OutFile $UpdaterPath -UseBasicParsing -TimeoutSec 120
 
 if ($CosignSource -and (Test-Path -LiteralPath $CosignSource -PathType Leaf)) {
     Copy-Item -LiteralPath $CosignSource -Destination $CosignPath -Force
@@ -24,32 +30,34 @@ if ($CosignSource -and (Test-Path -LiteralPath $CosignSource -PathType Leaf)) {
 
 $cosignHash = (Get-FileHash -LiteralPath $CosignPath -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($cosignHash -ne $ExpectedCosignSha256) { throw "Cosign SHA-256 mismatch: $cosignHash" }
-$versionText = (& $CosignPath version 2>&1 | Out-String)
-if ($LASTEXITCODE -ne 0 -or $versionText -notmatch 'GitVersion:\s+v3\.1\.3\b') { throw 'Expected Cosign v3.1.3.' }
+if (-not (Test-Path -LiteralPath $ChromePath -PathType Leaf)) { throw "Fast Browser is not installed: $ChromePath" }
 
-$chrome = Join-Path $env:LOCALAPPDATA 'Fast Sector\Fast Browser\Application\chrome.exe'
-$chromiumVersion = '0.0.0.0'
-if (Test-Path -LiteralPath $chrome -PathType Leaf) {
-    $rawChromeVersion = (Get-Item -LiteralPath $chrome).VersionInfo.FileVersion
-    $m = [regex]::Match([string]$rawChromeVersion, '\d+(?:\.\d+){1,3}')
-    if (-not $m.Success) { throw "Cannot determine installed Chromium version from: $rawChromeVersion" }
-    $chromiumVersion = ([version]$m.Value).ToString()
-}
+$manifest = Invoke-RestMethod -Uri ($ManifestUrl + '?ts=' + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) -TimeoutSec 30 -Headers @{ 'Cache-Control'='no-cache' }
+$rawVersion = (Get-Item -LiteralPath $ChromePath).VersionInfo.FileVersion
+$m = [regex]::Match([string]$rawVersion,'\d+(?:\.\d+){1,3}')
+if (-not $m.Success) { throw "Cannot determine Fast Browser Chromium version from: $rawVersion" }
+$localChromium = ([version]$m.Value).ToString()
+$remoteChromium = ([version][string]$manifest.chromiumVersion).ToString()
+$baselineHash = ''
+if ($localChromium -eq $remoteChromium) { $baselineHash = ([string]$manifest.sha256).ToLowerInvariant() }
 
 $state = [ordered]@{
     schema = 1
-    releaseVersion = $BaselineVersion
-    chromiumVersion = $chromiumVersion
-    installerSha256 = ''
+    releaseVersion = [string]$manifest.releaseVersion
+    chromiumVersion = $localChromium
+    installerSha256 = $baselineHash
     installedUtc = [DateTimeOffset]::UtcNow.ToString('o')
-} | ConvertTo-Json
-[IO.File]::WriteAllText($StatePath, $state + [Environment]::NewLine, $Utf8NoBom)
+}
+[IO.File]::WriteAllText($StatePath,(($state | ConvertTo-Json -Depth 4) + [Environment]::NewLine),$Utf8NoBom)
 
 $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-$taskName = 'Fast Browser Update Check'
-$taskRun = '"' + $psExe + '" -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $UpdaterPath + '"'
-& schtasks.exe /Create /TN $taskName /TR $taskRun /SC HOURLY /MO 1 /ST 00:47 /F | Out-Null
-if ($LASTEXITCODE -ne 0) { throw 'Failed to create Fast Browser Update Check scheduled task.' }
+$userId = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+$actionArgs = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $UpdaterPath + '"'
+$action = New-ScheduledTaskAction -Execute $psExe -Argument $actionArgs
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) -RepetitionInterval (New-TimeSpan -Hours 1)
+$principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Limited
+$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
+Register-ScheduledTask -TaskName 'Fast Browser Update Check' -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
 
 $protocolRoot = 'HKCU:\Software\Classes\fastbrowser-update'
 New-Item -Path $protocolRoot -Force | Out-Null
@@ -69,9 +77,7 @@ $shortcut = $wsh.CreateShortcut($shortcutPath)
 $shortcut.TargetPath = $psExe
 $shortcut.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $UpdaterPath + '" -Interactive'
 $shortcut.WorkingDirectory = $UpdaterDir
-if (Test-Path -LiteralPath $chrome -PathType Leaf) { $shortcut.IconLocation = $chrome + ',0' }
+$shortcut.IconLocation = $ChromePath + ',0'
 $shortcut.Save()
 
 Write-Host 'FAST BROWSER UPDATER INSTALLED' -ForegroundColor Green
-Write-Host "Task: $taskName"
-Write-Host "Manual shortcut: $shortcutPath"

@@ -1,0 +1,13 @@
+{
+    "schema":  1,
+    "enabled":  true,
+    "channel":  "stable",
+    "releaseVersion":  "1.2.0",
+    "chromiumVersion":  "155.0.8044.0",
+    "publishedUtc":  "2026-09-20T17:38:59.5053816+00:00",
+    "installerUrl":  "https://github.com/mustad450-pixel/fast-browser-releases/releases/download/v1.2.0/Fast-Browser-v1.2-Final-Setup.exe",
+    "sha256":  "573073e6f779e84de6cac0ba8f48d97cfeb2282df505a49edbbe0d01ebc59a53",
+    "sigstoreBundleUrl":  "https://github.com/mustad450-pixel/fast-browser-releases/releases/download/v1.2.0/Fast-Browser-v1.2-Final-Setup.exe.github-actions.sigstore.json",
+    "notesUrl":  "https://github.com/mustad450-pixel/fast-browser-releases/releases/tag/v1.2.0",
+    "minimumUpdaterVersion":  1
+}

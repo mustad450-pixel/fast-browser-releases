@@ -124,7 +124,7 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'Sigstore verification failed.' }
 
         Log 'SHA-256 and Sigstore verification passed. Installing update.'
-        $process = Start-Process -FilePath $installer -ArgumentList @('--do-not-launch-chrome','--verbose-logging') -Wait -PassThru
+        $process = Start-Process -FilePath $installer -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-') -Wait -PassThru
         if ($process.ExitCode -ne 0) {
             throw "Fast Browser installer exited with code $($process.ExitCode)."
         }

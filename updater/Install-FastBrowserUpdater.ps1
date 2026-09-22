@@ -1,10 +1,10 @@
 param(
+    [string]$UpdaterSource = '',
     [string]$CosignSource = ''
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
-
 Import-Module ScheduledTasks -ErrorAction Stop
 
 $ReleaseRepo = 'mustad450-pixel/fast-browser-releases'
@@ -12,15 +12,22 @@ $ManifestUrl = "https://raw.githubusercontent.com/$ReleaseRepo/main/update.json"
 $UpdaterUrl = "https://raw.githubusercontent.com/$ReleaseRepo/main/updater/FastBrowserUpdater.ps1"
 $CosignUrl = 'https://github.com/sigstore/cosign/releases/download/v3.1.3/cosign-windows-amd64.exe'
 $ExpectedCosignSha256 = '9fe59be0eca1271873ce019061335eb1ac419b7059202e797828467ddabe33be'
+
 $UpdaterDir = Join-Path $env:LOCALAPPDATA 'Fast Sector\Fast Browser\Updater'
 $UpdaterPath = Join-Path $UpdaterDir 'FastBrowserUpdater.ps1'
 $CosignPath = Join-Path $UpdaterDir 'cosign.exe'
 $StatePath = Join-Path $UpdaterDir 'state.json'
+$LauncherPath = Join-Path $UpdaterDir 'RunUpdaterHidden.vbs'
 $ChromePath = Join-Path $env:LOCALAPPDATA 'Fast Sector\Fast Browser\Application\chrome.exe'
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 New-Item -ItemType Directory -Path $UpdaterDir -Force | Out-Null
-Invoke-WebRequest -Uri ($UpdaterUrl + '?ts=' + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) -OutFile $UpdaterPath -UseBasicParsing -TimeoutSec 120
+
+if ($UpdaterSource -and (Test-Path -LiteralPath $UpdaterSource -PathType Leaf)) {
+    Copy-Item -LiteralPath $UpdaterSource -Destination $UpdaterPath -Force
+} else {
+    Invoke-WebRequest -Uri ($UpdaterUrl + '?ts=' + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) -OutFile $UpdaterPath -UseBasicParsing -TimeoutSec 120
+}
 
 if ($CosignSource -and (Test-Path -LiteralPath $CosignSource -PathType Leaf)) {
     Copy-Item -LiteralPath $CosignSource -Destination $CosignPath -Force
@@ -36,6 +43,7 @@ $manifest = Invoke-RestMethod -Uri ($ManifestUrl + '?ts=' + [DateTimeOffset]::Ut
 $rawVersion = (Get-Item -LiteralPath $ChromePath).VersionInfo.FileVersion
 $m = [regex]::Match([string]$rawVersion,'\d+(?:\.\d+){1,3}')
 if (-not $m.Success) { throw "Cannot determine Fast Browser Chromium version from: $rawVersion" }
+
 $localChromium = ([version]$m.Value).ToString()
 $remoteChromium = ([version][string]$manifest.chromiumVersion).ToString()
 $baselineHash = ''
@@ -51,33 +59,37 @@ $state = [ordered]@{
 [IO.File]::WriteAllText($StatePath,(($state | ConvertTo-Json -Depth 4) + [Environment]::NewLine),$Utf8NoBom)
 
 $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$command = '"' + $psExe + '" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $UpdaterPath + '"'
+$escapedCommand = $command.Replace('"','""')
+$vbs = @"
+Set sh = CreateObject("WScript.Shell")
+sh.Run "$escapedCommand", 0, False
+Set sh = Nothing
+"@
+[IO.File]::WriteAllText($LauncherPath,$vbs,$Utf8NoBom)
+
 $userId = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-$actionArgs = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $UpdaterPath + '"'
-$action = New-ScheduledTaskAction -Execute $psExe -Argument $actionArgs
+$wscript = Join-Path $env:SystemRoot 'System32\wscript.exe'
+$action = New-ScheduledTaskAction -Execute $wscript -Argument ('//B //Nologo "' + $LauncherPath + '"')
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) -RepetitionInterval (New-TimeSpan -Hours 1)
 $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
 Register-ScheduledTask -TaskName 'Fast Browser Update Check' -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
 
+# The native About-page handler replaced the old URL-protocol route.
 $protocolRoot = 'HKCU:\Software\Classes\fastbrowser-update'
-New-Item -Path $protocolRoot -Force | Out-Null
-Set-Item -Path $protocolRoot -Value 'URL:Fast Browser Update Protocol'
-New-ItemProperty -Path $protocolRoot -Name 'URL Protocol' -Value '' -PropertyType String -Force | Out-Null
-$commandKey = Join-Path $protocolRoot 'shell\open\command'
-New-Item -Path $commandKey -Force | Out-Null
-$protocolCommand = '"' + $psExe + '" -NoProfile -ExecutionPolicy Bypass -File "' + $UpdaterPath + '" -Interactive "%1"'
-Set-Item -Path $commandKey -Value $protocolCommand
+Remove-Item -LiteralPath $protocolRoot -Recurse -Force -ErrorAction SilentlyContinue
 
 $programs = [Environment]::GetFolderPath('Programs')
-$shortcutDir = Join-Path $programs 'Fast Browser'
-New-Item -ItemType Directory -Path $shortcutDir -Force | Out-Null
-$shortcutPath = Join-Path $shortcutDir 'Check for Fast Browser Updates.lnk'
-$wsh = New-Object -ComObject WScript.Shell
-$shortcut = $wsh.CreateShortcut($shortcutPath)
-$shortcut.TargetPath = $psExe
-$shortcut.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $UpdaterPath + '" -Interactive'
-$shortcut.WorkingDirectory = $UpdaterDir
-$shortcut.IconLocation = $ChromePath + ',0'
-$shortcut.Save()
+$oldShortcut = Join-Path $programs 'Fast Browser\Check for Fast Browser Updates.lnk'
+Remove-Item -LiteralPath $oldShortcut -Force -ErrorAction SilentlyContinue
 
-Write-Host 'FAST BROWSER UPDATER INSTALLED' -ForegroundColor Green
+$task = Get-ScheduledTask -TaskName 'Fast Browser Update Check' -ErrorAction Stop
+if ([string]$task.Actions[0].Execute -notmatch '(?i)\\wscript\.exe$') {
+    throw 'Updater task was not registered with the hidden wscript launcher.'
+}
+if (Test-Path -LiteralPath $protocolRoot) {
+    throw 'Obsolete fastbrowser-update protocol still exists.'
+}
+
+Write-Host 'FAST BROWSER UPDATER INSTALLED - SILENT TASK VERIFIED' -ForegroundColor Green
